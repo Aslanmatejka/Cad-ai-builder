@@ -1,0 +1,44 @@
+# Chat-to-CAD Platform - Core Dependencies
+
+# ============================================
+# Web Framework
+# ============================================
+fastapi>=0.128.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+
+# ============================================
+# CAD Geometry Engine
+# ============================================
+cadquery>=2.4.0
+ocp-tessellate>=3.0.3  # For STL/STEP export
+cq_warehouse @ git+https://github.com/gumyr/cq_warehouse.git  # Parametric parts (fasteners, bearings, etc.)
+
+# ============================================
+# LLM Integration (Anthropic Claude)
+# ============================================
+anthropic>=0.45.0  # Requires messages.stream() API
+
+# ============================================
+# Data Validation & Serialization
+# ============================================
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# ============================================
+# Environment & Configuration
+# ============================================
+python-dotenv>=1.0.0
+
+# ============================================
+# Async & Utilities
+# ============================================
+httpx>=0.26.0
+
+# ============================================
+# MySQL Database (optional — degrades gracefully)
+# ============================================
+pymysql>=1.1.0
+sqlalchemy>=2.0.0
+aiomysql>=0.3.0
+cryptography>=42.0.0

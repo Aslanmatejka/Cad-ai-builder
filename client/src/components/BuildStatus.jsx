@@ -2,14 +2,14 @@ import React from 'react';
 import './BuildStatus.css';
 import './AssemblyStyles.css';
 
-function BuildStatus({ status, error, result }) {
+function BuildStatus({ status, error, result, buildSteps }) {
   if (status === 'idle') return null;
 
   const designSource = result?.design || result?.designData || {};
   const units = designSource.units || 'mm';
   const features = Array.isArray(designSource.features) ? designSource.features : [];
   const cutouts = Array.isArray(designSource.cutouts) ? designSource.cutouts : [];
-  const defaultModelName = process.env.REACT_APP_AI_MODEL_NAME || 'GPT-5.1-Codex';
+  const defaultModelName = process.env.REACT_APP_AI_MODEL_NAME || 'Claude Sonnet 4.5';
   const aiModelName = result?.aiModel || defaultModelName;
   const productType = designSource.product_type || 'Custom product';
   const dimensionLength = designSource.length ?? '—';
@@ -17,18 +17,39 @@ function BuildStatus({ status, error, result }) {
   const dimensionHeight = designSource.height ?? '—';
   const wallThickness = designSource.wall_thickness ?? '—';
   const material = designSource.material || 'Not specified';
+  const steps = buildSteps || [];
 
   return (
     <div className="build-status">
       {status === 'building' && (
         <div className="status-building">
-          <div className="spinner"></div>
-          <h3>🏭 Building Your Product...</h3>
-          <div className="build-steps">
-            <p>✅ Analyzing your requirements with AI</p>
-            <p>⏳ Generating parametric CAD model</p>
-            <p>⏳ Creating 3D preview</p>
-            <p>⏳ Exporting manufacturing files</p>
+          <h3>🏭 Building Your Product</h3>
+          <div className="build-steps-live">
+            {steps.length === 0 && (
+              <div className="step-item active">
+                <span className="step-spinner"></span>
+                <span className="step-text">Starting build pipeline...</span>
+              </div>
+            )}
+            {steps
+              .sort((a, b) => a.step - b.step)
+              .map((s, i) => (
+              <div key={i} className={`step-item ${s.status}`}>
+                {s.status === 'done' && <span className="step-check">✓</span>}
+                {s.status === 'active' && <span className="step-spinner"></span>}
+                {s.status === 'error' && <span className="step-error">✕</span>}
+                {s.status === 'info' && <span className="step-info-icon">ℹ</span>}
+                <div className="step-content">
+                  <span className="step-text">{s.message}</span>
+                  {s.detail && (s.status === 'active' || s.status === 'error' || s.status === 'info') && (
+                    <span className="step-detail">{s.detail}</span>
+                  )}
+                  {s.healing?.resolved && (
+                    <span className="step-healing-badge">🛡️ Self-healed</span>
+                  )}
+                </div>
+              </div>
+            ))}
           </div>
         </div>
       )}
