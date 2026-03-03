@@ -31,7 +31,9 @@ yarn-error.log*
 exports/cad/*.step
 exports/cad/*.stl
 exports/cad/*.py
+exports/cad/*.glb
 exports/error_log.txt
+exports/uploads/
 
 # Environment
 .env
@@ -42,3 +44,7 @@ exports/error_log.txt
 .pytest_cache/
 .coverage
 htmlcov/
+# Test CAD files
+test_*.step
+test_*.stl
+test_*.iges
