@@ -14,7 +14,7 @@ try:
 except Exception:
     pass
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -25,6 +25,7 @@ import uuid
 import time
 import json
 import asyncio
+import hashlib
 
 # Import services
 from services import (
@@ -35,7 +36,9 @@ from services import (
     s3_service, 
     S3_AVAILABLE,
     glb_service,
-    GLB_AVAILABLE
+    GLB_AVAILABLE,
+    cad_import_service,
+    CAD_SUPPORTED_FORMATS,
 )
 from config import settings
 
@@ -79,7 +82,40 @@ except ImportError:
     CELERY_AVAILABLE = False
     print("⚠️  Celery not available - using synchronous processing")
 
+# ── In-memory scene store ─────────────────────────────────────
+_scenes: Dict[str, dict] = {}    # sceneId -> { sceneId, name, products: [...] }
+_products: Dict[str, dict] = {}  # instanceId -> product dict
 
+# ── Prompt cache ─────────────────────────────────────────────
+_prompt_cache: Dict[str, dict] = {}  # hash -> cached build result
+
+def _prompt_hash(prompt: str) -> str:
+    """Generate a deterministic hash for a prompt (new designs only)."""
+    return hashlib.sha256(prompt.strip().lower().encode()).hexdigest()[:16]
+
+def _check_prompt_cache(prompt: str) -> dict | None:
+    """Return cached result if the same prompt was built before."""
+    h = _prompt_hash(prompt)
+    cached = _prompt_cache.get(h)
+    if not cached:
+        return None
+    # Verify files still exist
+    stl_path = cached.get("stlFile", "")
+    if stl_path:
+        full_path = os.path.join(os.path.dirname(__file__), stl_path.lstrip("/"))
+        if not os.path.exists(full_path):
+            del _prompt_cache[h]
+            return None
+    return cached
+
+def _store_prompt_cache(prompt: str, result: dict):
+    """Cache a successful build result keyed by prompt hash."""
+    h = _prompt_hash(prompt)
+    _prompt_cache[h] = result
+    # Limit cache to 100 entries
+    if len(_prompt_cache) > 100:
+        oldest = next(iter(_prompt_cache))
+        del _prompt_cache[oldest]
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -335,6 +371,19 @@ async def build_product_stream(request: BuildRequest):
         print(f"{'='*60}\n")
 
         try:
+            # ── Cache-hit shortcut (new designs only) ────────────────────
+            if not is_modification and not request.previousDesign:
+                cached = _check_prompt_cache(request.prompt)
+                if cached:
+                    print(f"⚡ Prompt cache HIT — skipping AI")
+                    yield sse({"step": 1, "message": "Cache hit — reusing previous build", "status": "done"})
+                    yield sse({"step": 2, "message": "Skipped (cached)", "status": "done"})
+                    yield sse({"step": 3, "message": "Skipped (cached)", "status": "done"})
+                    yield sse({"step": 4, "message": "Skipped (cached)", "status": "done"})
+                    yield sse({"step": 5, "message": "Skipped (cached)", "status": "done"})
+                    yield sse({"step": 6, "message": "Build complete! (cached)", "status": "complete", "result": cached})
+                    return
+
             # Step 1: Searching product library
             yield sse({"step": 1, "message": "Searching product library for real-world dimensions and reference specs...", "status": "active", "detail": "Checking our database of 98+ product templates for matching measurements."})
             await asyncio.sleep(0.05)  # allow flush
@@ -506,6 +555,26 @@ async def build_product_stream(request: BuildRequest):
                             "success": True
                         }
                     })
+
+                    # Store in prompt cache (new designs only)
+                    if not is_modification:
+                        _store_prompt_cache(request.prompt, {
+                            "buildId": cad_result["buildId"],
+                            "stlUrl": cad_result["stlFile"],
+                            "stepUrl": cad_result["stepFile"],
+                            "parametricScript": cad_result.get("parametricScript"),
+                            "parameters": cad_result.get("parameters"),
+                            "explanation": cad_result.get("explanation"),
+                            "design": {
+                                "parameters": ai_response.get("parameters", []),
+                                "code": ai_response.get("code", ""),
+                                "explanation": ai_response.get("explanation", {})
+                            },
+                            "projectId": saved_project_id,
+                            "healingAttempts": attempt - 1 if attempt > 1 else 0,
+                            "success": True
+                        })
+
                     return  # done
 
                 except (RuntimeError, ValueError) as cad_err:
@@ -786,77 +855,80 @@ async def get_mesh_stats(build_id: str, file_type: str = "stl"):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Scene management endpoints (for frontend compatibility)
+# ── Scene management endpoints (stateful in-memory) ─────────────────────
 @app.post("/api/scene/create")
-async def create_scene():
+async def create_scene(body: dict = None):
     """Create a new scene for managing multiple products"""
     scene_id = str(uuid.uuid4())
+    name = (body or {}).get("name", "Default Scene")
     scene_data = {
         "sceneId": scene_id,
-        "name": "Default Scene",
-        "products": []
+        "name": name,
+        "products": [],
+        "createdAt": time.time(),
     }
-    return {
-        "success": True,
-        "scene": scene_data
-    }
+    _scenes[scene_id] = scene_data
+    return {"success": True, "scene": scene_data}
 
 @app.get("/api/scene/{scene_id}")
 async def get_scene(scene_id: str):
-    """Get scene details"""
-    return {
-        "success": True,
-        "sceneId": scene_id,
-        "name": "Default Scene",
-        "products": []
-    }
+    """Get scene details with all products"""
+    scene = _scenes.get(scene_id)
+    if not scene:
+        return {"success": True, "sceneId": scene_id, "name": "Default Scene", "products": []}
+    return {"success": True, **scene}
 
 @app.post("/api/scene/{scene_id}/add-product")
 async def add_product_to_scene(scene_id: str, product: dict):
     """Add a product to the scene"""
-    # Generate a unique instanceId if not provided
     if "instanceId" not in product or not product["instanceId"]:
         product["instanceId"] = str(uuid.uuid4())
-    return {
-        "success": True,
-        "sceneId": scene_id,
-        "product": product
-    }
+    # Ensure defaults
+    product.setdefault("position", {"x": 0, "y": 0, "z": 0})
+    product.setdefault("rotation", {"x": 0, "y": 0, "z": 0})
+    product.setdefault("scale", {"x": 1, "y": 1, "z": 1})
+    _products[product["instanceId"]] = product
+    if scene_id in _scenes:
+        _scenes[scene_id]["products"].append(product)
+    return {"success": True, "sceneId": scene_id, "product": product}
 
 @app.put("/api/scene/product/{instance_id}/transform")
 async def update_product_transform(instance_id: str, transform: dict):
     """Update a product's position/rotation/scale in the scene"""
-    return {
-        "success": True,
-        "instanceId": instance_id,
-        "position": transform.get("position", {"x": 0, "y": 0, "z": 0}),
-        "rotation": transform.get("rotation", {"x": 0, "y": 0, "z": 0}),
-        "scale": transform.get("scale", {"x": 1, "y": 1, "z": 1})
-    }
+    p = _products.get(instance_id, {})
+    p["position"] = transform.get("position", p.get("position", {"x": 0, "y": 0, "z": 0}))
+    p["rotation"] = transform.get("rotation", p.get("rotation", {"x": 0, "y": 0, "z": 0}))
+    p["scale"] = transform.get("scale", p.get("scale", {"x": 1, "y": 1, "z": 1}))
+    return {"success": True, "instanceId": instance_id, "position": p["position"], "rotation": p["rotation"], "scale": p["scale"]}
 
 @app.post("/api/scene/product/{instance_id}/duplicate")
 async def duplicate_product(instance_id: str, options: dict = None):
     """Duplicate a product in the scene with an offset"""
+    original = _products.get(instance_id, {})
     if options is None:
         options = {}
     offset = options.get("offset", {"x": 50, "y": 0, "z": 0})
     new_instance_id = str(uuid.uuid4())
-    return {
-        "success": True,
-        "duplicate": {
-            "instanceId": new_instance_id,
-            "originalId": instance_id,
-            "position": offset
-        }
+    new_product = {
+        **original,
+        "instanceId": new_instance_id,
+        "position": offset,
     }
+    _products[new_instance_id] = new_product
+    # Add to the same scene
+    for scene in _scenes.values():
+        if any(p.get("instanceId") == instance_id for p in scene["products"]):
+            scene["products"].append(new_product)
+            break
+    return {"success": True, "duplicate": {"instanceId": new_instance_id, "originalId": instance_id, "position": offset}}
 
 @app.delete("/api/scene/product/{instance_id}")
 async def delete_product_from_scene(instance_id: str):
     """Remove a product from the scene"""
-    return {
-        "success": True,
-        "deleted": instance_id
-    }
+    _products.pop(instance_id, None)
+    for scene in _scenes.values():
+        scene["products"] = [p for p in scene["products"] if p.get("instanceId") != instance_id]
+    return {"success": True, "deleted": instance_id}
 
 @app.post("/api/scene/{scene_id}/assemble")
 async def assemble_products(scene_id: str, assembly: dict):
@@ -876,11 +948,165 @@ async def assemble_products(scene_id: str, assembly: dict):
 @app.delete("/api/scene/assembly/{assembly_id}")
 async def disassemble_products(assembly_id: str):
     """Break an assembly back into individual products"""
-    return {
-        "success": True,
-        "disassembled": assembly_id
+    return {"success": True, "disassembled": assembly_id}
+
+@app.get("/api/cache/check")
+async def check_cache(prompt: str):
+    """Check if a prompt has a cached build result"""
+    cached = _check_prompt_cache(prompt)
+    if cached:
+        return {"success": True, "cached": True, "result": cached}
+    return {"success": True, "cached": False}
+
+
+
+# ── File Upload & NLP Edit Endpoints ─────────────────────────────────────
+
+@app.get("/api/upload/formats")
+async def get_supported_formats():
+    """Return list of supported upload formats"""
+    return {"success": True, **cad_import_service.get_supported_formats()}
+
+@app.post("/api/upload")
+async def upload_cad_file(file: UploadFile = File(...)):
+    """
+    Upload a CAD file for visualization and NLP editing.
+    Supports STEP, STL, IGES, DXF, OBJ, 3MF, PLY, BRep, GLB, glTF.
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+
+    ext = Path(file.filename).suffix.lower()
+    if ext not in CAD_SUPPORTED_FORMATS:
+        supported = ", ".join(sorted(CAD_SUPPORTED_FORMATS.keys()))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported format '{ext}'. Supported: {supported}"
+        )
+
+    # Read file content
+    file_bytes = await file.read()
+    max_size_mb = 100
+    if len(file_bytes) > max_size_mb * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum size is {max_size_mb} MB."
+        )
+
+    try:
+        result = await cad_import_service.import_file(
+            file_bytes=file_bytes,
+            original_filename=file.filename,
+        )
+        print(f"📤 File uploaded: {file.filename} → {result['buildId']}")
+        print(f"   Format: {result['format']} | BBox: {result.get('boundingBox', {})}")
+        print(f"   Editable (NLP): {result['editable']}")
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Import failed: {str(e)}")
+
+
+class NLPEditRequest(BaseModel):
+    buildId: str
+    prompt: str
+    importCode: Optional[str] = None
+    previousDesign: Optional[Dict[str, Any]] = None
+
+@app.post("/api/upload/edit")
+async def nlp_edit_uploaded_file(request: NLPEditRequest):
+    """
+    Apply a natural language edit to an uploaded CAD file.
+    Sends the import code + user prompt to Claude for code generation,
+    then executes the modified CadQuery code.
+    """
+    # Build "previous design" with the import code as the starting point
+    import_code = request.importCode or ""
+    if not import_code and request.previousDesign:
+        import_code = request.previousDesign.get("code", "")
+
+    if not import_code:
+        raise HTTPException(
+            status_code=400,
+            detail="No import code or previous design provided for editing."
+        )
+
+    # Send to Claude as a modification of the import code
+    previous_design = {
+        "code": import_code,
+        "parameters": request.previousDesign.get("parameters", []) if request.previousDesign else [],
+        "explanation": request.previousDesign.get("explanation", {}) if request.previousDesign else {},
     }
 
+    try:
+        ai_response = await claude_service.generate_design_from_prompt(
+            prompt=request.prompt,
+            previous_design=previous_design,
+        )
+
+        # Execute the AI-modified code
+        cad_result = await parametric_cad_service.generate_parametric_cad(ai_response)
+
+        return {
+            "success": True,
+            "buildId": cad_result["buildId"],
+            "stlUrl": cad_result["stlFile"],
+            "stepUrl": cad_result["stepFile"],
+            "parametricScript": cad_result.get("parametricScript"),
+            "parameters": cad_result.get("parameters"),
+            "explanation": cad_result.get("explanation"),
+            "design": {
+                "parameters": ai_response.get("parameters", []),
+                "code": ai_response.get("code", ""),
+                "explanation": ai_response.get("explanation", {}),
+            },
+        }
+    except (RuntimeError, ValueError) as cad_err:
+        # Self-healing: try fixing once
+        try:
+            fixed_response = await claude_service.fix_code_with_error(
+                failed_code=ai_response.get("code", ""),
+                error_message=str(cad_err),
+                original_prompt=request.prompt,
+                attempt=1,
+                max_retries=3,
+            )
+            cad_result = await parametric_cad_service.generate_parametric_cad(fixed_response)
+            return {
+                "success": True,
+                "buildId": cad_result["buildId"],
+                "stlUrl": cad_result["stlFile"],
+                "stepUrl": cad_result["stepFile"],
+                "parametricScript": cad_result.get("parametricScript"),
+                "parameters": cad_result.get("parameters"),
+                "explanation": cad_result.get("explanation"),
+                "design": {
+                    "parameters": fixed_response.get("parameters", []),
+                    "code": fixed_response.get("code", ""),
+                    "explanation": fixed_response.get("explanation", {}),
+                },
+                "healed": True,
+            }
+        except Exception as heal_err:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Edit failed after self-healing: {str(heal_err)}"
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"NLP edit failed: {str(e)}")
+
+
+# Also serve uploaded files
+@app.get("/exports/uploads/{filename}")
+async def serve_upload_file(filename: str):
+    """Serve uploaded source files"""
+    file_path = Path(settings.EXPORTS_DIR) / "uploads" / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path)
 
 
 # ── Project & History Endpoints (MySQL) ─────────────────────────────────

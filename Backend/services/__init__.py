@@ -22,6 +22,9 @@ except ImportError:
     glb_service = None
     GLB_AVAILABLE = False
 
+# CAD Import service (file upload support)
+from .cad_import_service import cad_import_service, SUPPORTED_FORMATS as CAD_SUPPORTED_FORMATS
+
 __all__ = [
     'claude_service', 
     'cadquery_service', 
@@ -32,5 +35,7 @@ __all__ = [
     's3_service', 
     'S3_AVAILABLE',
     'glb_service',
-    'GLB_AVAILABLE'
+    'GLB_AVAILABLE',
+    'cad_import_service',
+    'CAD_SUPPORTED_FORMATS',
 ]

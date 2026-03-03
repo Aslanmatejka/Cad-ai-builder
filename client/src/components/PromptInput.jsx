@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import './PromptInput.css';
 
-function PromptInput({ onBuild, isBuilding, hasExistingDesign }) {
+function PromptInput({ onBuild, isBuilding, hasExistingDesign, uploadedFile }) {
   const [prompt, setPrompt] = useState('');
   const textareaRef = useRef(null);
 
@@ -29,12 +29,24 @@ function PromptInput({ onBuild, isBuilding, hasExistingDesign }) {
     }
   };
 
-  const placeholder = hasExistingDesign
-    ? "Describe what to change... (Press Enter to send)"
-    : "Describe what you want to build... (Press Enter to send)";
+  const placeholder = uploadedFile
+    ? `Edit ${uploadedFile.filename} — describe changes... (Press Enter)`
+    : hasExistingDesign
+      ? "Describe what to change... (Press Enter to send)"
+      : "Describe what you want to build... (Press Enter to send)";
 
   return (
     <div className="prompt-input">
+      {uploadedFile && (
+        <div className="prompt-upload-badge">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+          </svg>
+          <span>{uploadedFile.filename}</span>
+          {uploadedFile.editable && <span className="badge-editable">NLP editable</span>}
+        </div>
+      )}
       <form onSubmit={handleSubmit}>
         <div className="input-wrapper">
           <textarea

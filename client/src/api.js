@@ -344,3 +344,75 @@ export async function getHistory() {
   if (!response.ok) throw new Error(`Failed to load history: ${response.status}`);
   return response.json();
 }
+
+// ── File Upload API ──────────────────────────────────────────────────────
+
+/**
+ * Get list of supported upload formats
+ */
+export async function getSupportedFormats() {
+  const response = await fetch(`${API_BASE_URL}/upload/formats`);
+  if (!response.ok) throw new Error(`Failed to load formats: ${response.status}`);
+  return response.json();
+}
+
+/**
+ * Upload a CAD file for visualization and NLP editing
+ * @param {File} file - The file to upload
+ * @param {function} onProgress - Optional progress callback (0-100)
+ * @returns Upload result with buildId, stlUrl, geometry info, etc.
+ */
+export async function uploadCADFile(file, onProgress = null) {
+  const formData = new FormData();
+  formData.append('file', file);
+
+  // Use XMLHttpRequest for progress tracking
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${API_BASE_URL}/upload`);
+
+    if (onProgress) {
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable) {
+          onProgress(Math.round((e.loaded / e.total) * 100));
+        }
+      });
+    }
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText));
+        } catch {
+          reject(new Error('Invalid response from server'));
+        }
+      } else {
+        try {
+          const err = JSON.parse(xhr.responseText);
+          reject(new Error(err.detail || `Upload failed: ${xhr.status}`));
+        } catch {
+          reject(new Error(`Upload failed: ${xhr.status}`));
+        }
+      }
+    };
+
+    xhr.onerror = () => reject(new Error('Network error during upload'));
+    xhr.send(formData);
+  });
+}
+
+/**
+ * Apply natural language edit to an uploaded CAD file
+ */
+export async function nlpEditUploadedFile(buildId, prompt, importCode, previousDesign = null) {
+  const response = await fetch(`${API_BASE_URL}/upload/edit`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ buildId, prompt, importCode, previousDesign }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({ detail: `Server error ${response.status}` }));
+    throw new Error(err.detail || `Edit failed: ${response.status}`);
+  }
+  return response.json();
+}
